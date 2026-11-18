@@ -148,6 +148,100 @@ describe('supports http with nodejs', function () {
     delete process.env.http_proxy;
     delete process.env.https_proxy;
     delete process.env.no_proxy;
+
+    delete Object.prototype.transport;
+    delete Object.prototype.transformResponse;
+    delete Object.prototype.responseType;
+    delete Object.prototype.responseEncoding;
+    delete Object.prototype.env;
+  });
+
+  it('should not use a transport inherited from a polluted Object.prototype', function (done) {
+    // Simulate a co-dependency polluting Object.prototype. `transport` is never
+    // set in axios defaults, so the merged config has no own `transport` and a
+    // direct `config.transport` read resolves the polluted value via the
+    // prototype chain. The malicious transport delegates to the real http so the
+    // request still completes and the only failing signal is the hijack flag.
+    var hijacked = false;
+    Object.prototype.transport = {
+      request: function () {
+        hijacked = true;
+        return http.request.apply(http, arguments);
+      }
+    };
+
+    server = http.createServer(function (req, res) {
+      res.end('ok');
+    }).listen(4444, function () {
+      axios.get(LOCAL_SERVER_URL + '/').then(function (res) {
+        assert.strictEqual(hijacked, false, 'axios used a transport inherited from Object.prototype');
+        assert.strictEqual(res.data, 'ok');
+        done();
+      }).catch(done);
+    });
+  });
+
+  it('should not use a transformResponse inherited from a polluted Object.prototype', function (done) {
+    // The defaults own `transformResponse` but the request config does not, so
+    // an unguarded mergeConfig read of the request config resolves the polluted
+    // value and it replaces the default response transform.
+    Object.prototype.transformResponse = function () {
+      return 'hijacked';
+    };
+
+    server = http.createServer(function (req, res) {
+      res.end('ok');
+    }).listen(4444, function () {
+      axios.get(LOCAL_SERVER_URL + '/').then(function (res) {
+        assert.strictEqual(res.data, 'ok');
+        done();
+      }).catch(done);
+    });
+  });
+
+  it('should not use a responseType inherited from a polluted Object.prototype', function (done) {
+    Object.prototype.responseType = 'arraybuffer';
+
+    server = http.createServer(function (req, res) {
+      res.end('ok');
+    }).listen(4444, function () {
+      axios.get(LOCAL_SERVER_URL + '/').then(function (res) {
+        assert.strictEqual(res.data, 'ok');
+        done();
+      }).catch(done);
+    });
+  });
+
+  it('should not use a responseEncoding inherited from a polluted Object.prototype', function (done) {
+    Object.prototype.responseEncoding = 'base64';
+
+    server = http.createServer(function (req, res) {
+      res.end('ok');
+    }).listen(4444, function () {
+      axios.get(LOCAL_SERVER_URL + '/').then(function (res) {
+        assert.strictEqual(res.data, 'ok');
+        done();
+      }).catch(done);
+    });
+  });
+
+  it('should not use an env.Blob inherited from a polluted Object.prototype', function () {
+    var hijacked = false;
+    Object.prototype.env = {
+      Blob: function () {
+        hijacked = true;
+      }
+    };
+
+    // A bare Axios instance has no `env` default, so the adapter config owns no `env`.
+    var instance = new axios.Axios({});
+
+    return instance.request({
+      url: 'data:text/plain;base64,b2s=',
+      responseType: 'blob'
+    }).then(noop, noop).then(function () {
+      assert.strictEqual(hijacked, false, 'axios used an env.Blob inherited from Object.prototype');
+    });
   });
 
   it('should throw an error if the timeout property is not parsable as a number', function (done) {
