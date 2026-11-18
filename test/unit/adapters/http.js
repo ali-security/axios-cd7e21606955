@@ -22,6 +22,7 @@ import devNull from 'dev-null';
 import {AbortController} from 'abortcontroller-polyfill/dist/cjs-ponyfill.js';
 import {__setProxy} from "../../../lib/adapters/http.js";
 import {FormData as FormDataPolyfill, Blob as BlobPolyfill, File as FilePolyfill} from 'formdata-node';
+import { EventEmitter } from 'events';
 
 const SERVER_PORT = 8020;
 
@@ -1841,6 +1842,301 @@ describe('supports http with nodejs', function () {
     }
   });
 
+  describe('Proxy-Authorization header leak on redirect (GHSA-j5f8-grm9-p9fc)', () => {
+    const PROXY_ENV_KEYS = ['http_proxy', 'HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY', 'no_proxy', 'NO_PROXY'];
+
+    async function withProxyEnv(env, fn) {
+      const saved = {};
+      for (const key of PROXY_ENV_KEYS) {
+        saved[key] = process.env[key];
+        delete process.env[key];
+      }
+      Object.assign(process.env, env);
+      try {
+        return await fn();
+      } finally {
+        for (const key of PROXY_ENV_KEYS) {
+          if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
+        }
+      }
+    }
+
+    it('clears a stale Proxy-Authorization header when redirected request resolves to no proxy (configProxy=false)', () => {
+      const options = {
+        headers: {},
+        beforeRedirects: {},
+        hostname: 'initial.example.com',
+        host: 'initial.example.com',
+        port: 80,
+      };
+
+      __setProxy(options, { host: '127.0.0.1', port: 8030, auth: { username: 'user', password: 'pass' } }, 'http://initial.example.com/start');
+      assert.strictEqual(
+        options.headers['Proxy-Authorization'],
+        'Basic ' + Buffer.from('user:pass', 'utf8').toString('base64'),
+        'initial request should carry Proxy-Authorization'
+      );
+
+      // Simulate redirect re-invocation where the redirected request is resolved to no proxy.
+      // This mirrors the beforeRedirects.proxy hook being called with configProxy=false.
+      const redirectOptions = {
+        headers: { ...options.headers },
+        beforeRedirects: {},
+        hostname: 'attacker.example.com',
+        host: 'attacker.example.com',
+        port: 443,
+      };
+      __setProxy(redirectOptions, false, 'https://attacker.example.com/final', true);
+
+      assert.strictEqual(
+        redirectOptions.headers['Proxy-Authorization'],
+        undefined,
+        'stale Proxy-Authorization must be stripped when redirected request no longer uses a proxy'
+      );
+    });
+
+    it('clears a stale Proxy-Authorization header when environment-derived proxy is bypassed on redirect (NO_PROXY)', () => {
+      const originalHttpProxy = process.env.http_proxy;
+      const originalHttpsProxy = process.env.https_proxy;
+      const originalNoProxy = process.env.no_proxy;
+
+      process.env.http_proxy = 'http://user:pass@127.0.0.1:8030';
+      process.env.https_proxy = 'http://user:pass@127.0.0.1:8030';
+      process.env.no_proxy = 'attacker.example.com';
+
+      try {
+        const options = {
+          headers: {},
+          beforeRedirects: {},
+          hostname: 'initial.example.com',
+          host: 'initial.example.com',
+          port: 80,
+        };
+
+        __setProxy(options, undefined, 'http://initial.example.com/start');
+        assert.strictEqual(
+          options.headers['Proxy-Authorization'],
+          'Basic ' + Buffer.from('user:pass', 'utf8').toString('base64'),
+          'initial request should pick up proxy credentials from env'
+        );
+
+        const redirectOptions = {
+          headers: { ...options.headers },
+          beforeRedirects: {},
+          hostname: 'attacker.example.com',
+          host: 'attacker.example.com',
+          port: 443,
+          protocol: 'https:',
+        };
+        __setProxy(redirectOptions, undefined, 'https://attacker.example.com/final', true);
+
+        assert.strictEqual(
+          redirectOptions.headers['Proxy-Authorization'],
+          undefined,
+          'stale Proxy-Authorization must be stripped when redirect target is covered by NO_PROXY'
+        );
+      } finally {
+        if (originalHttpProxy === undefined) delete process.env.http_proxy; else process.env.http_proxy = originalHttpProxy;
+        if (originalHttpsProxy === undefined) delete process.env.https_proxy; else process.env.https_proxy = originalHttpsProxy;
+        if (originalNoProxy === undefined) delete process.env.no_proxy; else process.env.no_proxy = originalNoProxy;
+      }
+    });
+
+    it('replaces Proxy-Authorization when redirect target resolves to a different proxy without credentials', () => {
+      const options = {
+        headers: {},
+        beforeRedirects: {},
+        hostname: 'initial.example.com',
+        host: 'initial.example.com',
+        port: 80,
+      };
+
+      __setProxy(options, { host: '127.0.0.1', port: 8030, auth: { username: 'user', password: 'pass' } }, 'http://initial.example.com/start');
+      assert.ok(options.headers['Proxy-Authorization'], 'precondition: initial proxy auth header set');
+
+      const redirectOptions = {
+        headers: { ...options.headers },
+        beforeRedirects: {},
+        hostname: 'second.example.com',
+        host: 'second.example.com',
+        port: 80,
+      };
+      __setProxy(redirectOptions, { host: '127.0.0.2', port: 8031 }, 'http://second.example.com/final', true);
+
+      assert.strictEqual(
+        redirectOptions.headers['Proxy-Authorization'],
+        undefined,
+        'stale credentials from previous proxy must not leak to a new proxy without credentials'
+      );
+    });
+
+    it('strips stale Proxy-Authorization when the beforeRedirects.proxy hook is invoked with configProxy=false', () => {
+      const options = {
+        headers: { 'Proxy-Authorization': 'Basic ' + Buffer.from('user:pass', 'utf8').toString('base64') },
+        beforeRedirects: {},
+        hostname: 'initial.example.com',
+        host: 'initial.example.com',
+        port: 80,
+      };
+
+      __setProxy(options, false, 'http://initial.example.com/start');
+      assert.strictEqual(typeof options.beforeRedirects.proxy, 'function', 'initial setProxy must install redirect hook');
+
+      const redirectOptions = {
+        headers: { 'Proxy-Authorization': 'Basic ' + Buffer.from('user:pass', 'utf8').toString('base64') },
+        beforeRedirects: {},
+        hostname: 'attacker.example.com',
+        host: 'attacker.example.com',
+        port: 443,
+        href: 'https://attacker.example.com/final',
+      };
+
+      options.beforeRedirects.proxy(redirectOptions);
+
+      assert.strictEqual(
+        redirectOptions.headers['Proxy-Authorization'],
+        undefined,
+        'beforeRedirects.proxy hook must strip stale Proxy-Authorization when redirect target has no proxy'
+      );
+    });
+
+    it('preserves a user-supplied Proxy-Authorization header on the initial request when no proxy is configured', () => {
+      const userValue = 'Basic ' + Buffer.from('alice:secret', 'utf8').toString('base64');
+      const options = {
+        headers: { 'Proxy-Authorization': userValue },
+        beforeRedirects: {},
+        hostname: 'example.com',
+        host: 'example.com',
+        port: 80,
+      };
+
+      __setProxy(options, false, 'http://example.com/start');
+
+      assert.strictEqual(
+        options.headers['Proxy-Authorization'],
+        userValue,
+        'user-supplied Proxy-Authorization must not be stripped on the initial request'
+      );
+    });
+
+    it('strips stale Proxy-Authorization regardless of header key casing', () => {
+      const staleValue = 'Basic ' + Buffer.from('user:pass', 'utf8').toString('base64');
+      const casings = ['proxy-authorization', 'PROXY-AUTHORIZATION', 'Proxy-authorization', 'pRoXy-AuThOrIzAtIoN'];
+
+      for (const casing of casings) {
+        const redirectOptions = {
+          headers: { [casing]: staleValue },
+          beforeRedirects: {},
+          hostname: 'attacker.example.com',
+          host: 'attacker.example.com',
+          port: 443,
+        };
+
+        __setProxy(redirectOptions, false, 'https://attacker.example.com/final', true);
+
+        const leaked = Object.keys(redirectOptions.headers).filter(
+          (name) => name.toLowerCase() === 'proxy-authorization'
+        );
+        assert.deepStrictEqual(
+          leaked,
+          [],
+          `stale Proxy-Authorization with key "${casing}" must be stripped regardless of casing`
+        );
+      }
+    });
+
+    it('strips Proxy-Authorization on an http -> https redirect when only HTTP_PROXY is configured', async () => {
+      const proxyUrl = 'http://user:pass@127.0.0.1:8030';
+
+      await withProxyEnv({ http_proxy: proxyUrl, HTTP_PROXY: proxyUrl }, () => {
+        const options = {
+          headers: {},
+          beforeRedirects: {},
+          hostname: 'victim.example.com',
+          host: 'victim.example.com',
+          port: 80,
+        };
+
+        __setProxy(options, undefined, 'http://victim.example.com/start');
+        assert.strictEqual(
+          options.headers['Proxy-Authorization'],
+          'Basic ' + Buffer.from('user:pass', 'utf8').toString('base64'),
+          'precondition: http request should go through the authenticated HTTP_PROXY'
+        );
+
+        // The attacker-controlled http:// endpoint answers with a redirect to https://, which
+        // resolves to no proxy because HTTPS_PROXY is unset.
+        const redirectOptions = {
+          headers: { ...options.headers },
+          beforeRedirects: {},
+          hostname: 'victim.example.com',
+          host: 'victim.example.com',
+          port: 443,
+          protocol: 'https:',
+          href: 'https://victim.example.com/final',
+        };
+        options.beforeRedirects.proxy(redirectOptions);
+
+        assert.strictEqual(redirectOptions.hostname, 'victim.example.com', 'https redirect target should be reached directly');
+        assert.strictEqual(
+          redirectOptions.headers['Proxy-Authorization'],
+          undefined,
+          'proxy credentials must not be sent directly to the https redirect target'
+        );
+      });
+    });
+
+    it('does not send proxy credentials to a NO_PROXY origin reached through a followed redirect', async () => {
+      let proxyAuthorization;
+      let originHeaders;
+
+      const proxyServer = await startHTTPServer({
+        handler: (req, res) => {
+          proxyAuthorization = req.headers['proxy-authorization'];
+          res.statusCode = 302;
+          res.setHeader('Location', 'http://localhost:4444/final');
+          res.end();
+        },
+        port: 4000
+      });
+
+      const originServer = await startHTTPServer({
+        handler: (req, res) => {
+          originHeaders = req.headers;
+          res.end('origin');
+        },
+        port: 4444
+      });
+
+      try {
+        await withProxyEnv({
+          http_proxy: 'http://user:pass@localhost:4000/',
+          HTTP_PROXY: 'http://user:pass@localhost:4000/',
+          no_proxy: 'localhost:4444',
+          NO_PROXY: 'localhost:4444'
+        }, async () => {
+          const {data} = await axios.get('http://localhost:4001/start');
+          assert.strictEqual(data, 'origin');
+        });
+      } finally {
+        await stopHTTPServer(proxyServer);
+        await stopHTTPServer(originServer);
+      }
+
+      assert.strictEqual(
+        proxyAuthorization,
+        'Basic ' + Buffer.from('user:pass', 'utf8').toString('base64'),
+        'precondition: initial request should go through the authenticated proxy'
+      );
+      assert.ok(originHeaders, 'redirected request did not reach the origin');
+      assert.strictEqual(
+        originHeaders['proxy-authorization'],
+        undefined,
+        'proxy credentials must not leak to the redirect target'
+      );
+    });
+  });
+
   it('should support cancel', function (done) {
     var source = axios.CancelToken.source();
     server = http.createServer(function (req, res) {
@@ -2162,34 +2458,57 @@ describe('supports http with nodejs', function () {
       }
 
       async function sendWithPollutedPrototype(payload, getHeaders) {
-        let receivedHeaders;
-        const server = await startHTTPServer({
-          handler: (req, res) => {
-            receivedHeaders = req.headers;
-            res.end('{}');
+        // Use a stub transport rather than a real HTTP server: polluting
+        // Object.prototype in-process can destabilise Node's HTTP server
+        // internals and cause spurious ECONNRESET. The stub captures the final
+        // outgoing headers axios constructs, which is what these tests assert on.
+        let capturedHeaders;
+        const stubTransport = {
+          request(options, handleResponse) {
+            capturedHeaders = { ...options.headers };
+            const req = new EventEmitter();
+            req.write = () => true;
+            req.setTimeout = () => {};
+            req.destroy = () => {};
+            req.end = () => {
+              const res = new stream.Readable({ read() {} });
+              res.statusCode = 200;
+              res.statusMessage = 'OK';
+              res.headers = {};
+              res.rawHeaders = [];
+              res.req = req;
+              process.nextTick(() => {
+                handleResponse(res);
+                res.push(null);
+              });
+            };
+            return req;
           },
-          port: SERVER_PORT
-        });
+        };
 
         try {
           pollute(getHeaders);
           await axios.post(
-            `http://localhost:${server.address().port}/`,
+            'http://stub.invalid/',
             payload,
-            { headers: { 'Authorization': 'Bearer VALID_USER_TOKEN' } }
+            {
+              headers: { 'Authorization': 'Bearer VALID_USER_TOKEN' },
+              transport: stubTransport,
+              maxRedirects: 0,
+            }
           );
         } finally {
           cleanup();
-          await stopHTTPServer(server);
         }
 
-        return receivedHeaders;
+        return capturedHeaders;
       }
 
-      function assertNotInjected(receivedHeaders) {
-        assert.ok(receivedHeaders, 'request did not reach server');
-        assert.strictEqual(receivedHeaders['x-injected'], undefined);
-        assert.notStrictEqual(receivedHeaders['authorization'], 'Bearer ATTACKER_TOKEN');
+      function assertNotInjected(capturedHeaders) {
+        assert.ok(capturedHeaders, 'transport was not invoked');
+        assert.strictEqual(capturedHeaders['x-injected'], undefined);
+        assert.notStrictEqual(capturedHeaders['Authorization'], 'Bearer ATTACKER_TOKEN');
+        assert.notStrictEqual(capturedHeaders['authorization'], 'Bearer ATTACKER_TOKEN');
       }
 
       it('should not merge prototype-polluted getHeaders into outgoing request', async () => {
