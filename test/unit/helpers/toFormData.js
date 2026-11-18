@@ -13,6 +13,71 @@ describe('helpers::toFormData', function () {
     return o;
   }
 
+  function createFormDataSpy() {
+    const calls = [];
+    return {
+      calls,
+      append(key, value) {
+        calls.push([key, value]);
+      }
+    };
+  }
+
+  describe('prototype pollution', function () {
+    it('should ignore a visitor inherited only from Object.prototype', function () {
+      let called = false;
+      Object.prototype.visitor = () => {
+        called = true;
+        return false;
+      };
+
+      try {
+        const formData = createFormDataSpy();
+        toFormData({ field: 'value' }, formData);
+
+        assert.strictEqual(called, false);
+        assert.deepStrictEqual(formData.calls, [['field', 'value']]);
+      } finally {
+        delete Object.prototype.visitor;
+      }
+    });
+
+    it('should ignore maxDepth inherited only from Object.prototype', function () {
+      Object.prototype.maxDepth = 0;
+
+      try {
+        const formData = createFormDataSpy();
+        assert.doesNotThrow(() => toFormData({ nested: { field: 'value' } }, formData));
+        assert.deepStrictEqual(formData.calls, [['nested[field]', 'value']]);
+      } finally {
+        delete Object.prototype.maxDepth;
+      }
+    });
+
+    it('should ignore serializer options inherited only from Object.prototype', function () {
+      Object.prototype.dots = true;
+      Object.prototype.metaTokens = false;
+
+      try {
+        const formData = createFormDataSpy();
+        toFormData({ nested: { field: 'value' }, 'json{}': { a: 1 } }, formData, {});
+        assert.deepStrictEqual(formData.calls, [
+          ['nested[field]', 'value'],
+          ['json{}', '{"a":1}']
+        ]);
+      } finally {
+        delete Object.prototype.dots;
+        delete Object.prototype.metaTokens;
+      }
+    });
+
+    it('should still honor own options', function () {
+      const formData = createFormDataSpy();
+      toFormData({ nested: { field: 'value' } }, formData, { dots: true });
+      assert.deepStrictEqual(formData.calls, [['nested.field', 'value']]);
+    });
+  });
+
   describe('maxDepth option', function () {
     it('should throw AxiosError when payload exceeds default depth limit (100)', function () {
       try {

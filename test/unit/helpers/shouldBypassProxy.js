@@ -24,6 +24,32 @@ describe('helpers::shouldBypassProxy', () => {
     }
   });
 
+  it('should fail closed for malformed CIDR-style entries', () => {
+    for (const entry of ['10.0.0.0/33', 'fd00::/129', 'example.com/24', '10.0.0.0/01']) {
+      setNoProxy(entry);
+
+      assert.strictEqual(shouldBypassProxy('http://10.0.0.1/'), false);
+      assert.strictEqual(shouldBypassProxy('http://[fd00::1]/'), false);
+    }
+  });
+
+  it('should handle a long non-matching dotted entry within the test timeout', function () {
+    this.timeout(1000);
+    setNoProxy(`example.com${'.'.repeat(100000)}invalid`);
+
+    assert.strictEqual(shouldBypassProxy('http://example.com/'), false);
+  });
+
+  it('should handle a long dotted request hostname within the test timeout', function () {
+    this.timeout(1000);
+    setNoProxy('localhost');
+
+    assert.strictEqual(
+      shouldBypassProxy(`http://example.com${'.'.repeat(100000)}invalid/`),
+      false
+    );
+  });
+
   it('should bypass proxy for localhost with a trailing dot', () => {
     setNoProxy('localhost,127.0.0.1,::1');
 
