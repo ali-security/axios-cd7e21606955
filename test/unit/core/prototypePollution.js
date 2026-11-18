@@ -8,6 +8,7 @@ import mergeConfig from "../../../lib/core/mergeConfig.js";
 import validator from "../../../lib/helpers/validator.js";
 import defaults from "../../../lib/defaults/index.js";
 import AxiosHeaders from "../../../lib/core/AxiosHeaders.js";
+import buildURL from "../../../lib/helpers/buildURL.js";
 
 const nodeMajorVersion = parseInt(process.versions.node.split('.')[0], 10);
 
@@ -1321,6 +1322,236 @@ describe("Prototype Pollution Protection", function () {
       } finally {
         await stopServer(server);
       }
+    });
+  });
+
+  // GHSA-7q8q-rj6j-mhjq (CVE-2026-67319): nested option objects such as
+  // `auth: {}` and `paramsSerializer: {}` are cloned into ordinary objects by
+  // mergeConfig, so reading their fields with plain dotted access picked up
+  // values injected onto a polluted Object.prototype (Basic Authorization
+  // header injection, query-string tampering).
+  describe('GHSA-7q8q-rj6j-mhjq nested option objects', function () {
+    const pollutedKeys = ['username', 'password', 'serialize', 'encode'];
+
+    function pollute(key, value) {
+      Object.defineProperty(Object.prototype, key, {
+        value,
+        configurable: true,
+        writable: true
+      });
+    }
+
+    afterEach(function () {
+      pollutedKeys.forEach((key) => {
+        delete Object.prototype[key];
+      });
+    });
+
+    describe('utils.getSafeProp / utils.hasOwnInPrototypeChain', function () {
+      it('should honor own properties', function () {
+        assert.strictEqual(utils.hasOwnInPrototypeChain({ username: 'own' }, 'username'), true);
+        assert.strictEqual(utils.getSafeProp({ username: 'own' }, 'username'), 'own');
+      });
+
+      it('should honor members inherited from a non-Object.prototype source', function () {
+        class Serializer {
+          serialize() {
+            return 'class=1';
+          }
+        }
+        const template = { encode() {} };
+
+        assert.strictEqual(utils.getSafeProp(new Serializer(), 'serialize'), Serializer.prototype.serialize);
+        assert.strictEqual(utils.getSafeProp(Object.create(template), 'encode'), template.encode);
+      });
+
+      it('should ignore values reachable only through a polluted Object.prototype', function () {
+        pollute('username', 'inherited-user');
+
+        // sanity: the pollution primitive is active for plain dotted reads
+        assert.strictEqual({}.username, 'inherited-user');
+
+        assert.strictEqual(utils.hasOwnInPrototypeChain({}, 'username'), false);
+        assert.strictEqual(utils.getSafeProp({}, 'username'), undefined);
+        assert.strictEqual(utils.getSafeProp(function () {}, 'username'), undefined);
+      });
+
+      it('should tolerate nullish and null-prototype inputs', function () {
+        const bare = Object.create(null);
+        bare.username = 'own';
+
+        assert.strictEqual(utils.getSafeProp(null, 'username'), undefined);
+        assert.strictEqual(utils.getSafeProp(undefined, 'username'), undefined);
+        assert.strictEqual(utils.getSafeProp(bare, 'username'), 'own');
+        assert.strictEqual(utils.getSafeProp(Object.create(null), 'username'), undefined);
+      });
+
+      it('should stop prototype-chain walks on cyclic Proxy prototypes', function () {
+        let calls = 0;
+        const proxy = new Proxy({}, {
+          getPrototypeOf() {
+            calls += 1;
+            if (calls > 5) {
+              throw new Error('cycled');
+            }
+            return proxy;
+          }
+        });
+
+        assert.strictEqual(utils.hasOwnInPrototypeChain(proxy, 'missing'), false);
+        assert.strictEqual(utils.getSafeProp(proxy, 'missing'), undefined);
+        assert.ok(calls <= 2, 'prototype chain walk must stop on a cycle');
+      });
+    });
+
+    describe('buildURL', function () {
+      it('should ignore inherited serialize and encode on an empty options object', function () {
+        let serializeInvoked = false;
+        let encodeInvoked = false;
+
+        pollute('serialize', function () {
+          serializeInvoked = true;
+          return 'polluted=1';
+        });
+        pollute('encode', function () {
+          encodeInvoked = true;
+          return 'polluted';
+        });
+
+        assert.strictEqual(buildURL('/foo', { value: 'a b' }, {}), '/foo?value=a+b');
+        assert.strictEqual(serializeInvoked, false);
+        assert.strictEqual(encodeInvoked, false);
+      });
+
+      it('should still use own and class-provided serialize/encode options', function () {
+        class ClassSerializer {
+          serialize(params) {
+            return 'class=' + params.a;
+          }
+        }
+
+        pollute('serialize', function () {
+          return 'polluted=1';
+        });
+
+        assert.strictEqual(buildURL('/foo', { a: 1 }, { serialize: () => 'own=1' }), '/foo?own=1');
+        assert.strictEqual(buildURL('/foo', { a: 'b' }, { encode: (v) => 'x' + v }), '/foo?xa=xb');
+        assert.strictEqual(buildURL('/foo', { a: 1 }, new ClassSerializer()), '/foo?class=1');
+      });
+    });
+
+    describe('axios.getUri', function () {
+      it('should ignore inherited serialize and encode on an empty paramsSerializer', function () {
+        let invoked = false;
+
+        pollute('serialize', function () {
+          invoked = true;
+          return 'polluted=1';
+        });
+        pollute('encode', function () {
+          invoked = true;
+          return 'polluted';
+        });
+
+        assert.strictEqual(
+          axios.getUri({ url: '/foo', params: { value: 'a b' }, paramsSerializer: {} }),
+          '/foo?value=a+b'
+        );
+        assert.strictEqual(invoked, false);
+      });
+    });
+
+    describe('http adapter', function () {
+      it('should not build Basic auth from inherited username/password on an empty auth object', async function () {
+        this.timeout(10000);
+        pollute('username', 'attacker');
+        pollute('password', 'exfil');
+
+        const server = await startServer();
+        const { port } = server.address();
+
+        try {
+          const res = await axios.get(`http://127.0.0.1:${port}/demo`, { auth: {} });
+          assert.strictEqual(
+            res.data.headers.authorization,
+            'Basic ' + Buffer.from(':', 'utf8').toString('base64')
+          );
+        } finally {
+          await stopServer(server);
+        }
+      });
+
+      it('should still send own auth credentials when Object.prototype is polluted', async function () {
+        this.timeout(10000);
+        pollute('username', 'attacker');
+        pollute('password', 'exfil');
+
+        const server = await startServer();
+        const { port } = server.address();
+
+        try {
+          const res = await axios.get(`http://127.0.0.1:${port}/demo`, {
+            auth: { username: 'Aladdin', password: 'open sesame' }
+          });
+          assert.strictEqual(
+            res.data.headers.authorization,
+            'Basic ' + Buffer.from('Aladdin:open sesame', 'utf8').toString('base64')
+          );
+        } finally {
+          await stopServer(server);
+        }
+      });
+
+      it('should not let an inherited serialize tamper with the query string', async function () {
+        this.timeout(10000);
+        let serializeInvoked = false;
+
+        pollute('serialize', function () {
+          serializeInvoked = true;
+          return 'polluted=1';
+        });
+
+        const server = await startServer();
+        const { port } = server.address();
+
+        try {
+          const res = await axios.get(`http://127.0.0.1:${port}/demo`, {
+            params: { value: 'a b' },
+            paramsSerializer: {}
+          });
+          assert.strictEqual(res.data.url, '/demo?value=a+b');
+          assert.strictEqual(serializeInvoked, false);
+        } finally {
+          await stopServer(server);
+        }
+      });
+
+      it('should neutralize the advisory proof of concept (auth + paramsSerializer)', async function () {
+        this.timeout(10000);
+        pollute('username', 'attacker');
+        pollute('password', 'exfil');
+        pollute('serialize', function () {
+          return 'polluted=1';
+        });
+
+        const server = await startServer();
+        const { port } = server.address();
+
+        try {
+          const res = await axios.get(`http://127.0.0.1:${port}/demo`, {
+            auth: {},
+            paramsSerializer: {},
+            params: { unused: 'ignored' }
+          });
+          assert.notStrictEqual(
+            res.data.headers.authorization,
+            'Basic ' + Buffer.from('attacker:exfil', 'utf8').toString('base64')
+          );
+          assert.strictEqual(res.data.url, '/demo?unused=ignored');
+        } finally {
+          await stopServer(server);
+        }
+      });
     });
   });
 });
