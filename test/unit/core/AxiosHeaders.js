@@ -74,6 +74,39 @@ describe('AxiosHeaders', function () {
 
       assert.strictEqual(headers.get('foo'), 'value2');
     })
+
+    it('should sanitize invalid characters in header value', function () {
+      const headers = new AxiosHeaders();
+
+      headers.set('x-test', '\t safe\r\nInjected: true \u0000');
+
+      assert.strictEqual(headers.get('x-test'), 'safeInjected: true');
+    });
+
+    it('should sanitize invalid characters in any array header value', function () {
+      const headers = new AxiosHeaders();
+
+      headers.set('set-cookie', ['safe=1', ' \tunsafe=1\nInjected: true\r\n ']);
+
+      assert.deepStrictEqual(headers.get('set-cookie'), ['safe=1', 'unsafe=1Injected: true']);
+    });
+
+    it('should sanitize CRLF in header values passed as an object', function () {
+      const headers = new AxiosHeaders({
+        'x-test': 'ok\r\n\r\nGET /latest/api/token HTTP/1.1\r\nHost: 169.254.169.254'
+      });
+
+      assert.strictEqual(headers.get('x-test'), 'okGET /latest/api/token HTTP/1.1Host: 169.254.169.254');
+      assert.strictEqual(headers.toString(), 'x-test: okGET /latest/api/token HTTP/1.1Host: 169.254.169.254');
+    });
+
+    it('should preserve valid visible, obs-text and inner whitespace characters', function () {
+      const headers = new AxiosHeaders();
+
+      headers.set('x-test', 'a\tb c~é');
+
+      assert.strictEqual(headers.get('x-test'), 'a\tb c~é');
+    });
   });
 
   describe('get', function () {
