@@ -53,6 +53,31 @@ describe('utils', function (){
       }
       assert.equal(utils.isFormData(new FormData()), true);
     });
+
+    it('should not treat plain objects as FormData even if they look like one (GHSA-6chq-wfr3-2hj9)', () => {
+      const spoofed = {append() {}, [Symbol.toStringTag]: 'FormData'};
+      assert.equal(utils.isFormData(spoofed), false);
+
+      const nullProto = Object.create(null);
+      nullProto.append = () => {};
+      nullProto[Symbol.toStringTag] = 'FormData';
+      assert.equal(utils.isFormData(nullProto), false);
+
+      const legacySpoof = {append() {}, toString() { return '[object FormData]'; }};
+      assert.equal(utils.isFormData(legacySpoof), false);
+    });
+
+    it('should not treat plain objects as FormData when Object.prototype is polluted (GHSA-6chq-wfr3-2hj9)', () => {
+      Object.prototype[Symbol.toStringTag] = 'FormData';
+      Object.prototype.append = () => {};
+
+      try {
+        assert.equal(utils.isFormData({userId: 42}), false);
+      } finally {
+        delete Object.prototype[Symbol.toStringTag];
+        delete Object.prototype.append;
+      }
+    });
   });
 
   describe('toJSON', function (){

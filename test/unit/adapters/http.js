@@ -2069,6 +2069,84 @@ describe('supports http with nodejs', function () {
       });
     });
 
+    describe('prototype pollution (GHSA-6chq-wfr3-2hj9)', () => {
+      const pollutedKeys = ['getHeaders', 'append', 'pipe', 'on', 'once'];
+      const toStringTagSym = Symbol.toStringTag;
+
+      // The polluted Symbol.toStringTag makes every plain object fail utils.isPlainObject, so the
+      // attacker's getHeaders() returns a null-prototype object (or a raw header block) that
+      // AxiosHeaders#set still merges into the outgoing request.
+      const injectedHeadersObject = () => Object.assign(Object.create(null), {
+        'x-injected': 'attacker',
+        'authorization': 'Bearer ATTACKER_TOKEN',
+      });
+
+      const injectedHeadersString = () => 'X-Injected: attacker\r\nAuthorization: Bearer ATTACKER_TOKEN';
+
+      function pollute(getHeaders) {
+        Object.prototype[toStringTagSym] = 'FormData';
+        Object.prototype.append = () => {};
+        Object.prototype.getHeaders = getHeaders;
+        Object.prototype.pipe = function (d) { if (d && d.end) d.end(); return d; };
+        Object.prototype.on = function () { return this; };
+        Object.prototype.once = function () { return this; };
+      }
+
+      function cleanup() {
+        for (const k of pollutedKeys) delete Object.prototype[k];
+        delete Object.prototype[toStringTagSym];
+      }
+
+      async function sendWithPollutedPrototype(payload, getHeaders) {
+        let receivedHeaders;
+        const server = await startHTTPServer({
+          handler: (req, res) => {
+            receivedHeaders = req.headers;
+            res.end('{}');
+          },
+          port: SERVER_PORT
+        });
+
+        try {
+          pollute(getHeaders);
+          await axios.post(
+            `http://localhost:${server.address().port}/`,
+            payload,
+            { headers: { 'Authorization': 'Bearer VALID_USER_TOKEN' } }
+          );
+        } finally {
+          cleanup();
+          await stopHTTPServer(server);
+        }
+
+        return receivedHeaders;
+      }
+
+      function assertNotInjected(receivedHeaders) {
+        assert.ok(receivedHeaders, 'request did not reach server');
+        assert.strictEqual(receivedHeaders['x-injected'], undefined);
+        assert.notStrictEqual(receivedHeaders['authorization'], 'Bearer ATTACKER_TOKEN');
+      }
+
+      it('should not merge prototype-polluted getHeaders into outgoing request', async () => {
+        assertNotInjected(await sendWithPollutedPrototype({ userId: 42 }, injectedHeadersObject));
+      });
+
+      it('should not merge a prototype-polluted raw header block into outgoing request', async () => {
+        assertNotInjected(await sendWithPollutedPrototype({ userId: 42 }, injectedHeadersString));
+      });
+
+      it('should not merge prototype-polluted getHeaders for class instance payloads', async () => {
+        class Payload {
+          constructor() {
+            this.userId = 42;
+          }
+        }
+
+        assertNotInjected(await sendWithPollutedPrototype(new Payload(), injectedHeadersObject));
+      });
+    });
+
     describe('toFormData helper', function () {
       it('should properly serialize nested objects for parsing with multer.js (express.js)', function (done) {
         var app = express();
